@@ -301,6 +301,79 @@ async function checkReadRate(db, endpoint, ipHash, nowMs) {
   return !!row && row.count <= 60
 }
 
+async function checkMutationRate(db, ipHash, nowMs) {
+  const windowStart = Math.floor(nowMs / (10 * 60 * 1000))
+  await db
+    .prepare('INSERT INTO rate_limits (key, window_start, count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(key, window_start) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at')
+    .bind(`admin-mutation:ip:${ipHash}`, windowStart, new Date(nowMs).toISOString())
+    .run()
+  const row = await db
+    .prepare('SELECT count FROM rate_limits WHERE key = ? AND window_start = ?')
+    .bind(`admin-mutation:ip:${ipHash}`, windowStart)
+    .first()
+  return !!row && row.count <= 20
+}
+
+async function handleMutation(request, env, origin, endpoint, handler) {
+  const ip = request.headers.get('CF-Connecting-IP') || ''
+  const ipHash = await sha256Hex(ip)
+  try {
+    const allowed = await checkMutationRate(env.DB, ipHash, Date.now())
+    if (!allowed) return errorResponse(origin, 429, 'Too many attempts. Please try again later.', 'RATE_LIMITED')
+  } catch {
+    return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
+  }
+  const { auth, error } = await authenticate(request, env, origin)
+  if (error) {
+    try {
+      await audit(env.DB, '', 'admin_access_denied', 'api', endpoint, '', false)
+    } catch {
+    }
+    return error
+  }
+  let body = null
+  try {
+    body = await request.json()
+  } catch {
+    body = null
+  }
+  if (!body || typeof body !== 'object') return errorResponse(origin, 400, 'Invalid request.', 'INVALID_BODY')
+  try {
+    const result = await handler(env, auth, body)
+    if (result === null) return errorResponse(origin, 404, 'Not found.', 'NOT_FOUND')
+    if (result.error) return errorResponse(origin, result.status || 400, result.message, result.code || 'INVALID')
+    return jsonResponse(origin, 200, { ok: true, ...result.data })
+  } catch {
+    return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
+  }
+}
+
+async function handleEntitlementUpdate(env, auth, userId, body) {
+  const plans = ['free', 'growth', 'max']
+  const statuses = ['active', 'cancelled']
+  const plan = typeof body.plan === 'string' ? body.plan : null
+  const status = typeof body.status === 'string' ? body.status : null
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : ''
+  if (plan !== null && !plans.includes(plan)) return { error: true, status: 400, message: 'Invalid plan.', code: 'INVALID_PLAN' }
+  if (status !== null && !statuses.includes(status)) return { error: true, status: 400, message: 'Invalid status.', code: 'INVALID_STATUS' }
+  if (plan === null && status === null) return { error: true, status: 400, message: 'Choose a plan or a status to change.', code: 'NO_CHANGE_FIELD' }
+  if (reason.length < 10 || reason.length > 500) return { error: true, status: 400, message: 'A reason between 10 and 500 characters is required.', code: 'INVALID_REASON' }
+  const current = await env.DB.prepare('SELECT plan, status FROM entitlements WHERE user_id = ?').bind(userId).first()
+  if (!current) return null
+  const prevPlan = current.plan
+  const prevStatus = current.status
+  const nextPlan = plan === null ? prevPlan : plan
+  const nextStatus = status === null ? prevStatus : status
+  if (nextPlan === prevPlan && nextStatus === prevStatus) return { error: true, status: 400, message: 'No change from the current subscription.', code: 'NO_CHANGE' }
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await env.DB.batch([
+    env.DB.prepare('UPDATE entitlements SET plan = ?, status = ?, updated_at = ? WHERE user_id = ?').bind(nextPlan, nextStatus, nowIso, userId),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'entitlement_corrected', 'entitlement', userId, reason, 1, correlationId, nowIso),
+  ])
+  return { data: { userId, plan: nextPlan, status: nextStatus, previousPlan: prevPlan, previousStatus: prevStatus } }
+}
+
 async function handleRead(request, env, origin, endpoint, handler) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
   const ipHash = await sha256Hex(ip)
@@ -361,6 +434,11 @@ export default {
     }
     if (method === 'GET' && path === '/api/audit-log') {
       return handleRead(request, env, origin, 'audit-log', async (dbEnv) => handleAuditLog(dbEnv, url))
+    }
+    if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/entitlement')) {
+      const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/entitlement'.length))
+      if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
+      return handleMutation(request, env, origin, 'entitlement-update', async (dbEnv, auth, body) => handleEntitlementUpdate(dbEnv, auth, userId, body))
     }
     if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path === '/api/audit-log') {
       return errorResponse(origin, 405, 'Method not allowed.', 'METHOD_NOT_ALLOWED')
