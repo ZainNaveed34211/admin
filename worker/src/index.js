@@ -456,6 +456,33 @@ async function handlePayments(env, url) {
   return { payments: rows.results || [], total: totalRow ? totalRow.total : 0, page, pageSize }
 }
 
+const SERVICE_HEALTH_URLS = [
+  { service: 'seo-api', url: 'https://seo-api.kluzar.com/api/health' },
+  { service: 'manage-api', url: 'https://manage-api.kluzar.com/api/health' },
+  { service: 'business-api', url: 'https://business-api.kluzar.com/api/health' },
+  { service: 'dashboard-api', url: 'https://dashboard-api.kluzar.com/api/health' },
+]
+
+async function probeService(entry) {
+  const started = Date.now()
+  try {
+    const res = await fetch(entry.url, { signal: AbortSignal.timeout(5000) })
+    return { service: entry.service, url: entry.url, ok: res.ok, status: res.status, ms: Date.now() - started }
+  } catch {
+    return { service: entry.service, url: entry.url, ok: false, status: null, ms: Date.now() - started }
+  }
+}
+
+async function handleServices() {
+  const probed = await Promise.all(SERVICE_HEALTH_URLS.map((entry) => probeService(entry)))
+  const services = [
+    { service: 'account-api', url: 'https://account-api.kluzar.com', ok: null, status: null, ms: null, note: 'No public health endpoint' },
+    { service: 'admin-api', url: 'https://admin-api.kluzar.com', ok: true, status: 200, ms: 0, note: 'This service' },
+    ...probed,
+  ]
+  return { services, checkedAt: new Date().toISOString() }
+}
+
 async function handleRead(request, env, origin, endpoint, handler) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
   const ipHash = await sha256Hex(ip)
@@ -520,6 +547,9 @@ export default {
     if (method === 'GET' && path === '/api/payments') {
       return handleRead(request, env, origin, 'payments', async (dbEnv) => handlePayments(dbEnv, url))
     }
+    if (method === 'GET' && path === '/api/services') {
+      return handleRead(request, env, origin, 'services', async () => handleServices())
+    }
     if (method === 'GET' && path.startsWith('/api/companies/')) {
       const companyId = decodeURIComponent(path.slice('/api/companies/'.length))
       if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
@@ -546,7 +576,7 @@ export default {
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'entitlement-update', async (dbEnv, auth, body) => handleEntitlementUpdate(dbEnv, auth, userId, body))
     }
-    if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path.startsWith('/api/companies/') || path === '/api/payments' || path === '/api/audit-log') {
+    if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path.startsWith('/api/companies/') || path === '/api/payments' || path === '/api/services' || path === '/api/audit-log') {
       return errorResponse(origin, 405, 'Method not allowed.', 'METHOD_NOT_ALLOWED')
     }
     return errorResponse(origin, 404, 'Not found.', 'NOT_FOUND')
