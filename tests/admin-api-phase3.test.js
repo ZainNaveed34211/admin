@@ -18,7 +18,7 @@ function makeReadDb() {
         return {
           async first() {
               if (sql.includes('FROM sessions') && sql.includes('WHERE s.id')) {
-                return { id: 'sess-1', user_id: 'user-1', expires_at: new Date(NOW + 3600 * 1000).toISOString(), user_status: 'active', user_email: 'admin@example.test' }
+                return { id: 'sess-1', user_id: 'user-1', expires_at: new Date(NOW + 3600 * 1000).toISOString(), scope: 'admin', user_status: 'active', user_email: 'admin@example.test' }
               }
               if (sql.includes('FROM admin_allowlist')) return { user_id: 'user-1' }
               if (sql.includes('FROM rate_limits')) return { count: rateCounts.get(params[0]) || 0 }

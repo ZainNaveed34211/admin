@@ -55,6 +55,7 @@ function sessionRow(overrides = {}) {
     id: 'sess-1',
     user_id: 'user-1',
     expires_at: new Date(NOW + 3600 * 1000).toISOString(),
+    scope: 'admin',
     user_status: 'active',
     user_email: 'admin@example.test',
     ...overrides,
@@ -147,6 +148,8 @@ test('verify rejects non-allowlisted users, missing MFA, dead sessions, inactive
   assert.equal((await call(envInactive, '/api/auth/verify', { method: 'POST', token })).status, 401)
   const envNoSession = { DB: makeDb({ session: null }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
   assert.equal((await call(envNoSession, '/api/auth/verify', { method: 'POST', token })).status, 401)
+  const envFullScope = { DB: makeDb({ session: sessionRow({ scope: 'full' }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  assert.equal((await call(envFullScope, '/api/auth/verify', { method: 'POST', token })).status, 403)
 })
 
 test('verify rejects wrong origin, missing bearer, and unknown paths', async () => {

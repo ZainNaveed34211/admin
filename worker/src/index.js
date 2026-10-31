@@ -95,6 +95,7 @@ async function authenticate(request, env, origin) {
   if (new Date(session.expires_at).getTime() <= Date.now()) {
     return { auth: null, error: errorResponse(origin, 401, 'Session expired.', 'UNAUTHORIZED') }
   }
+  if (session.scope !== 'admin') return { auth: null, error: errorResponse(origin, 403, 'Admin session required.', 'FORBIDDEN') }
   if (session.user_status !== 'active') return { auth: null, error: errorResponse(origin, 401, 'Account is not active.', 'UNAUTHORIZED') }
   if (verified.payload.mfa !== true) return { auth: null, error: errorResponse(origin, 403, 'MFA is required for admin access.', 'MFA_REQUIRED') }
   const allowRow = await env.DB.prepare(
