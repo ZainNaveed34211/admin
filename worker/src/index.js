@@ -436,6 +436,26 @@ async function handleMemberRemove(env, auth, companyId, userId, body) {
   return { data: { companyId, userId, status: 'removed', previousRole: prevRole } }
 }
 
+async function handlePayments(env, url) {
+  const { page, pageSize, offset } = parsePagination(url)
+  const plan = url.searchParams.get('plan') || ''
+  const status = url.searchParams.get('status') || ''
+  const where = []
+  const params = []
+  if (plan) {
+    where.push('e.plan = ?')
+    params.push(plan)
+  }
+  if (status) {
+    where.push('e.status = ?')
+    params.push(status)
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+  const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS total FROM entitlements e ${whereSql}`).bind(...params).first()
+  const rows = await env.DB.prepare(`SELECT e.user_id, u.email, e.plan, e.status, e.provider, e.provider_subscription_id, e.current_period_end, e.updated_at FROM entitlements e LEFT JOIN users u ON u.id = e.user_id ${whereSql} ORDER BY e.updated_at DESC LIMIT ? OFFSET ?`).bind(...params, pageSize, offset).all()
+  return { payments: rows.results || [], total: totalRow ? totalRow.total : 0, page, pageSize }
+}
+
 async function handleRead(request, env, origin, endpoint, handler) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
   const ipHash = await sha256Hex(ip)
@@ -497,6 +517,9 @@ export default {
     if (method === 'GET' && path === '/api/audit-log') {
       return handleRead(request, env, origin, 'audit-log', async (dbEnv) => handleAuditLog(dbEnv, url))
     }
+    if (method === 'GET' && path === '/api/payments') {
+      return handleRead(request, env, origin, 'payments', async (dbEnv) => handlePayments(dbEnv, url))
+    }
     if (method === 'GET' && path.startsWith('/api/companies/')) {
       const companyId = decodeURIComponent(path.slice('/api/companies/'.length))
       if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
@@ -523,7 +546,7 @@ export default {
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'entitlement-update', async (dbEnv, auth, body) => handleEntitlementUpdate(dbEnv, auth, userId, body))
     }
-    if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path === '/api/audit-log') {
+    if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path.startsWith('/api/companies/') || path === '/api/payments' || path === '/api/audit-log') {
       return errorResponse(origin, 405, 'Method not allowed.', 'METHOD_NOT_ALLOWED')
     }
     return errorResponse(origin, 404, 'Not found.', 'NOT_FOUND')
