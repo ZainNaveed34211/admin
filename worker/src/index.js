@@ -374,6 +374,68 @@ async function handleEntitlementUpdate(env, auth, userId, body) {
   return { data: { userId, plan: nextPlan, status: nextStatus, previousPlan: prevPlan, previousStatus: prevStatus } }
 }
 
+function reasonError(body) {
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : ''
+  if (reason.length < 10 || reason.length > 500) return { error: true, status: 400, message: 'A reason between 10 and 500 characters is required.', code: 'INVALID_REASON' }
+  return null
+}
+
+async function handleCompanyDetail(env, companyId) {
+  const company = await env.DB.prepare('SELECT id, name, owner_user_id, created_at, updated_at FROM companies WHERE id = ?').bind(companyId).first()
+  if (!company) return null
+  const members = await env.DB.prepare('SELECT m.user_id, m.role, m.status, m.department_id, m.joined_at, u.email FROM company_members m LEFT JOIN users u ON u.id = m.user_id WHERE m.company_id = ? ORDER BY m.joined_at ASC').bind(companyId).all()
+  return { company, members: members.results || [] }
+}
+
+async function loadActiveMember(env, companyId, userId) {
+  const company = await env.DB.prepare('SELECT id, owner_user_id FROM companies WHERE id = ?').bind(companyId).first()
+  if (!company) return { company: null, member: null }
+  const member = await env.DB.prepare("SELECT user_id, role, status FROM company_members WHERE company_id = ? AND user_id = ? AND status = 'active'").bind(companyId, userId).first()
+  return { company, member }
+}
+
+async function handleMemberRole(env, auth, companyId, userId, body) {
+  const roles = ['admin', 'manager', 'employee']
+  const role = typeof body.role === 'string' ? body.role : null
+  if (role === null || !roles.includes(role)) return { error: true, status: 400, message: 'Invalid role.', code: 'INVALID_ROLE' }
+  const badReason = reasonError(body)
+  if (badReason) return badReason
+  const { company, member } = await loadActiveMember(env, companyId, userId)
+  if (!company) return null
+  if (!member) return { error: true, status: 404, message: 'Member not found.', code: 'NOT_FOUND' }
+  if (company.owner_user_id === userId) return { error: true, status: 400, message: 'The company owner cannot be changed here.', code: 'OWNER_PROTECTED' }
+  if (member.role === role) return { error: true, status: 400, message: 'No change from the current role.', code: 'NO_CHANGE' }
+  const prevRole = member.role
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await env.DB.batch([
+    env.DB.prepare('UPDATE company_members SET role = ? WHERE company_id = ? AND user_id = ?').bind(role, companyId, userId),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_role_changed', 'company_member', userId, body.reason.trim(), 1, correlationId, nowIso),
+  ])
+  return { data: { companyId, userId, role, previousRole: prevRole } }
+}
+
+async function handleMemberRemove(env, auth, companyId, userId, body) {
+  const badReason = reasonError(body)
+  if (badReason) return badReason
+  const { company, member } = await loadActiveMember(env, companyId, userId)
+  if (!company) return null
+  if (!member) return { error: true, status: 404, message: 'Member not found.', code: 'NOT_FOUND' }
+  if (company.owner_user_id === userId) return { error: true, status: 400, message: 'The company owner cannot be removed here.', code: 'OWNER_PROTECTED' }
+  if (member.role === 'owner') {
+    const owners = await env.DB.prepare("SELECT COUNT(*) AS c FROM company_members WHERE company_id = ? AND role = 'owner' AND status = 'active'").bind(companyId).first()
+    if (!owners || owners.c <= 1) return { error: true, status: 400, message: 'The last owner-role member cannot be removed.', code: 'LAST_OWNER' }
+  }
+  const prevRole = member.role
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await env.DB.batch([
+    env.DB.prepare("UPDATE company_members SET status = 'removed' WHERE company_id = ? AND user_id = ?").bind(companyId, userId),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_removed', 'company_member', userId, body.reason.trim(), 1, correlationId, nowIso),
+  ])
+  return { data: { companyId, userId, status: 'removed', previousRole: prevRole } }
+}
+
 async function handleRead(request, env, origin, endpoint, handler) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
   const ipHash = await sha256Hex(ip)
@@ -434,6 +496,27 @@ export default {
     }
     if (method === 'GET' && path === '/api/audit-log') {
       return handleRead(request, env, origin, 'audit-log', async (dbEnv) => handleAuditLog(dbEnv, url))
+    }
+    if (method === 'GET' && path.startsWith('/api/companies/')) {
+      const companyId = decodeURIComponent(path.slice('/api/companies/'.length))
+      if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
+      return handleRead(request, env, origin, 'company-detail', async (dbEnv) => handleCompanyDetail(dbEnv, companyId))
+    }
+    if (method === 'POST' && path.startsWith('/api/companies/') && path.endsWith('/role')) {
+      const rest = path.slice('/api/companies/'.length, -'/role'.length)
+      const parts = rest.split('/')
+      if (parts.length !== 3 || parts[1] !== 'members' || !parts[0] || !parts[2] || parts[0].length > 128 || parts[2].length > 128) return errorResponse(origin, 400, 'Invalid member id.', 'INVALID_ID')
+      const companyId = decodeURIComponent(parts[0])
+      const userId = decodeURIComponent(parts[2])
+      return handleMutation(request, env, origin, 'member-role', async (dbEnv, auth, body) => handleMemberRole(dbEnv, auth, companyId, userId, body))
+    }
+    if (method === 'POST' && path.startsWith('/api/companies/') && path.endsWith('/remove')) {
+      const rest = path.slice('/api/companies/'.length, -'/remove'.length)
+      const parts = rest.split('/')
+      if (parts.length !== 3 || parts[1] !== 'members' || !parts[0] || !parts[2] || parts[0].length > 128 || parts[2].length > 128) return errorResponse(origin, 400, 'Invalid member id.', 'INVALID_ID')
+      const companyId = decodeURIComponent(parts[0])
+      const userId = decodeURIComponent(parts[2])
+      return handleMutation(request, env, origin, 'member-remove', async (dbEnv, auth, body) => handleMemberRemove(dbEnv, auth, companyId, userId, body))
     }
     if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/entitlement')) {
       const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/entitlement'.length))
