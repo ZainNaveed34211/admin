@@ -192,7 +192,11 @@ test('rate limits: verify endpoint and read endpoints trip after their budgets',
 test('no secret columns are selected or returned anywhere', async () => {
   const dir = path.dirname(fileURLToPath(import.meta.url))
   const source = fs.readFileSync(path.join(dir, '..', 'worker', 'src', 'index.js'), 'utf8')
-  assert.ok(!/SELECT[^;]*(password_hash|token_hash|csrf_token|ip_hash)/.test(source), 'a SELECT names a secret column')
+  const selectStatements = [...source.matchAll(/'(SELECT[^']*)'/g)].map((m) => m[1])
+  assert.ok(selectStatements.length > 0, 'no SELECT statements found to check')
+  for (const stmt of selectStatements) {
+    assert.ok(!/(password_hash|token_hash|csrf_token|ip_hash)/.test(stmt), `a SELECT names a secret column: ${stmt.slice(0, 80)}`)
+  }
   const { pub, priv } = await keypair()
   const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
   const res = await call(env, '/api/users/user-1', { tok: await token(priv) })

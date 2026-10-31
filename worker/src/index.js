@@ -495,6 +495,141 @@ async function handleMemberRemove(env, auth, companyId, userId, body) {
   return { data: { companyId, userId, status: 'removed', previousRole: prevRole } }
 }
 
+function randomHexBytes(count) {
+  const bytes = new Uint8Array(count)
+  crypto.getRandomValues(bytes)
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function b64encodeBytes(bytes) {
+  let text = ''
+  for (const b of bytes) text += String.fromCharCode(b)
+  return btoa(text)
+}
+
+async function hashTempPassword(password) {
+  const salt = new Uint8Array(16)
+  crypto.getRandomValues(salt)
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256)
+  return `pbkdf2-sha256$100000$${b64encodeBytes(salt)}$${b64encodeBytes(new Uint8Array(bits))}`
+}
+
+function generateTempPassword() {
+  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const lower = 'abcdefghijklmnopqrstuvwxyz'
+  const digits = '0123456789'
+  const symbols = '!@#$%^&*'
+  const all = upper + lower + digits + symbols
+  const pick = (set) => set[crypto.getRandomValues(new Uint32Array(1))[0] % set.length]
+  const chars = [pick(upper), pick(lower), pick(digits), pick(symbols)]
+  for (let i = 0; i < 16; i++) chars.push(pick(all))
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1)
+    const tmp = chars[i]
+    chars[i] = chars[j]
+    chars[j] = tmp
+  }
+  return chars.join('')
+}
+
+function normalizeAdminEmail(email) {
+  return String(email || '').trim().toLowerCase()
+}
+
+function validAdminEmail(email) {
+  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim()) && email.length <= 254
+}
+
+async function handleUserCreate(env, auth, body) {
+  const email = typeof body.email === 'string' ? normalizeAdminEmail(body.email) : ''
+  const firstName = typeof body.firstName === 'string' ? body.firstName.trim() : ''
+  const lastName = typeof body.lastName === 'string' ? body.lastName.trim() : ''
+  const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
+  const plan = typeof body.plan === 'string' ? body.plan : 'free'
+  const badReason = reasonError(body)
+  if (badReason) return badReason
+  if (!validAdminEmail(email)) return { error: true, status: 400, message: 'Enter a valid email.', code: 'INVALID_EMAIL' }
+  if (!['free', 'growth', 'max'].includes(plan)) return { error: true, status: 400, message: 'Invalid plan.', code: 'INVALID_PLAN' }
+  if (firstName.length > 100 || lastName.length > 100 || phone.length > 30) return { error: true, status: 400, message: 'Name or phone is too long.', code: 'INVALID_FIELD' }
+  const existing = await env.DB.prepare('SELECT id FROM users WHERE email_normalized = ?').bind(email).first()
+  if (existing) return { error: true, status: 409, message: 'A user with this email already exists.', code: 'USER_EXISTS' }
+  const userId = randomHexBytes(16)
+  const tempPassword = generateTempPassword()
+  const passwordHash = await hashTempPassword(tempPassword)
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO users (id, email, email_normalized, password_hash, status, email_verified, mfa_enabled, first_name, last_name, phone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(userId, email, email, passwordHash, 'pending_mfa', 0, 0, firstName, lastName, phone, nowIso, nowIso),
+    env.DB.prepare('INSERT INTO entitlements (user_id, plan, status, updated_at) VALUES (?, ?, ?, ?)').bind(userId, plan, 'active', nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_created', 'user', userId, body.reason.trim(), 1, correlationId, nowIso),
+  ])
+  return { data: { userId, email, plan, tempPassword } }
+}
+
+async function handleUserDeactivate(env, auth, userId, body) {
+  const badReason = reasonError(body)
+  if (badReason) return badReason
+  if (auth.userId === userId) return { error: true, status: 403, message: 'You cannot deactivate your own account.', code: 'SELF_PROTECTED' }
+  const user = await env.DB.prepare('SELECT status FROM users WHERE id = ?').bind(userId).first()
+  if (!user) return null
+  if (user.status === 'suspended') return { error: true, status: 400, message: 'This account is already suspended.', code: 'ALREADY_SUSPENDED' }
+  const prevStatus = user.status
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await env.DB.batch([
+    env.DB.prepare("UPDATE users SET status = 'suspended', updated_at = ? WHERE id = ?").bind(nowIso, userId),
+    env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_deactivated', 'user', userId, body.reason.trim(), 1, correlationId, nowIso),
+  ])
+  return { data: { userId, status: 'suspended', previousStatus: prevStatus } }
+}
+
+async function handleUserReactivate(env, auth, userId, body) {
+  const badReason = reasonError(body)
+  if (badReason) return badReason
+  const user = await env.DB.prepare('SELECT status, mfa_enabled FROM users WHERE id = ?').bind(userId).first()
+  if (!user) return null
+  if (user.status !== 'suspended') return { error: true, status: 400, message: 'This account is not suspended.', code: 'NOT_SUSPENDED' }
+  const nextStatus = user.mfa_enabled === 1 ? 'active' : 'pending_mfa'
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await env.DB.batch([
+    env.DB.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?').bind(nextStatus, nowIso, userId),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_reactivated', 'user', userId, body.reason.trim(), 1, correlationId, nowIso),
+  ])
+  return { data: { userId, status: nextStatus, previousStatus: 'suspended' } }
+}
+
+async function handleMemberAdd(env, auth, companyId, body) {
+  const email = typeof body.email === 'string' ? normalizeAdminEmail(body.email) : ''
+  const roles = ['admin', 'manager', 'employee']
+  const role = typeof body.role === 'string' ? body.role : null
+  const badReason = reasonError(body)
+  if (badReason) return badReason
+  if (!validAdminEmail(email)) return { error: true, status: 400, message: 'Enter a valid email.', code: 'INVALID_EMAIL' }
+  if (role === null || !roles.includes(role)) return { error: true, status: 400, message: 'Invalid role.', code: 'INVALID_ROLE' }
+  const company = await env.DB.prepare('SELECT id, owner_user_id FROM companies WHERE id = ?').bind(companyId).first()
+  if (!company) return null
+  const user = await env.DB.prepare('SELECT id, status FROM users WHERE email_normalized = ?').bind(email).first()
+  if (!user) return { error: true, status: 404, message: 'No account with this email. Create the user first.', code: 'USER_NOT_FOUND' }
+  if (company.owner_user_id === user.id) return { error: true, status: 400, message: 'The company owner is already the owner.', code: 'OWNER_PROTECTED' }
+  if (user.status === 'suspended') return { error: true, status: 400, message: 'This account is suspended.', code: 'USER_SUSPENDED' }
+  const existing = await env.DB.prepare('SELECT status FROM company_members WHERE company_id = ? AND user_id = ?').bind(companyId, user.id).first()
+  if (existing && existing.status === 'active') return { error: true, status: 400, message: 'This user is already a member.', code: 'ALREADY_MEMBER' }
+  const nowIso = new Date().toISOString()
+  const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const ops = []
+  if (existing) {
+    ops.push(env.DB.prepare('UPDATE company_members SET role = ?, status = ?, joined_at = ? WHERE company_id = ? AND user_id = ?').bind(role, 'active', nowIso, companyId, user.id))
+  } else {
+    ops.push(env.DB.prepare('INSERT INTO company_members (company_id, user_id, role, department_id, status, invited_by, joined_at) VALUES (?, ?, ?, NULL, ?, ?, ?)').bind(companyId, user.id, role, 'active', auth.userId, nowIso))
+  }
+  ops.push(env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_added', 'company_member', user.id, body.reason.trim(), 1, correlationId, nowIso))
+  await env.DB.batch(ops)
+  return { data: { companyId, userId: user.id, email, role, status: 'active' } }
+}
+
 async function handlePayments(env, url) {
   const { page, pageSize, offset } = parsePagination(url)
   const plan = url.searchParams.get('plan') || ''
@@ -637,6 +772,24 @@ export default {
       const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/entitlement'.length))
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'entitlement-update', async (dbEnv, auth, body) => handleEntitlementUpdate(dbEnv, auth, userId, body))
+    }
+    if (method === 'POST' && path === '/api/users') {
+      return handleMutation(request, env, origin, 'user-create', async (dbEnv, auth, body) => handleUserCreate(dbEnv, auth, body))
+    }
+    if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/deactivate')) {
+      const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/deactivate'.length))
+      if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
+      return handleMutation(request, env, origin, 'user-deactivate', async (dbEnv, auth, body) => handleUserDeactivate(dbEnv, auth, userId, body))
+    }
+    if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/reactivate')) {
+      const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/reactivate'.length))
+      if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
+      return handleMutation(request, env, origin, 'user-reactivate', async (dbEnv, auth, body) => handleUserReactivate(dbEnv, auth, userId, body))
+    }
+    if (method === 'POST' && path.startsWith('/api/companies/') && path.endsWith('/members')) {
+      const companyId = decodeURIComponent(path.slice('/api/companies/'.length, -'/members'.length))
+      if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
+      return handleMutation(request, env, origin, 'member-add', async (dbEnv, auth, body) => handleMemberAdd(dbEnv, auth, companyId, body))
     }
     if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path.startsWith('/api/companies/') || path === '/api/payments' || path === '/api/services' || path === '/api/audit-log' || path === '/api/audit-log/export') {
       return errorResponse(origin, 405, 'Method not allowed.', 'METHOD_NOT_ALLOWED')
