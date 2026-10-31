@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apex Pro Wireless Headphones | Advanced Product Page</title>
+  <style>
+    :root {
+      --primary-color: #4f46e5;
+      --primary-hover: #4338ca;
+      --text-main: #111827;
+      --text-muted: #6b7280;
+      --bg-light: #f9fafb;
+      --border-color: #e5e7eb;
+      --radius: 12px;
+      --transition: all 0.2s ease-in-out;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      color: var(--text-main);
+      background-color: #f3f4f6;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .product-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 40px;
+      background: #ffffff;
+      max-width: 1050px;
+      width: 100%;
+      padding: 40px;
+      border-radius: var(--radius);
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.05);
+    }
+
+    /* Gallery Section */
+    .gallery {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+
+    .main-image-wrapper {
+      position: relative;
+      background: var(--bg-light);
+      border-radius: var(--radius);
+      overflow: hidden;
+      aspect-ratio: 1 / 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .main-image-wrapper img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: var(--transition);
+    }
+
+    .thumbnails {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+
+    .thumb {
+      border: 2px solid transparent;
+      border-radius: 8px;
+      overflow: hidden;
+      cursor: pointer;
+      aspect-ratio: 1 / 1;
+      background: var(--bg-light);
+      transition: var(--transition);
+    }
+
+    .thumb.active, .thumb:hover {
+      border-color: var(--primary-color);
+    }
+
+    .thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* Product Details Section */
+    .product-info {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .badge {
+      display: inline-block;
+      background: #e0e7ff;
+      color: var(--primary-color);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 4px 10px;
+      border-radius: 20px;
+      margin-bottom: 12px;
+      width: fit-content;
+    }
+
+    .product-title {
+      font-size: 2rem;
+      font-weight: 800;
+      line-height: 1.2;
+      margin-bottom: 10px;
+    }
+
+    .rating {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #f59e0b;
+      font-size: 0.9rem;
+      margin-bottom: 15px;
+    }
+
+    .rating span {
+      color: var(--text-muted);
+      margin-left: 5px;
+    }
+
+    .price-box {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .current-price {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    .original-price {
+      font-size: 1.1rem;
+      color: var(--text-muted);
+      text-decoration: line-through;
+    }
+
+    .description {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      line-height: 1.6;
+      margin-bottom: 25px;
+    }
+
+    /* Options (Colors & Specs) */
+    .option-group {
+      margin-bottom: 20px;
+    }
+
+    .option-label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 10px;
+      display: block;
+    }
+
+    .color-swatches {
+      display: flex;
+      gap: 12px;
+    }
+
+    .swatch {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      cursor: pointer;
+      border: 2px solid transparent;
+      outline: 2px solid transparent;
+      outline-offset: 2px;
+      transition: var(--transition);
+    }
+
+    .swatch.selected {
+      outline-color: var(--primary-color);
+    }
+
+    .swatch-indigo { background-color: #4f46e5; }
+    .swatch-obsidian { background-color: #1f2937; }
+    .swatch-silver { background-color: #9ca3af; }
+
+    /* Actions & Buttons */
+    .actions {
+      display: flex;
+      gap: 15px;
+      margin-top: 10px;
+    }
+
+    .qty-selector {
+      display: flex;
+      align-items: center;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .qty-btn {
+      background: none;
+      border: none;
+      width: 40px;
+      height: 48px;
+      font-size: 1.2rem;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    .qty-btn:hover {
+      background: var(--bg-light);
+    }
+
+    .qty-input {
+      width: 45px;
+      text-align: center;
+      border: none;
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .btn-cart {
+      flex: 1;
+      background: var(--primary-color);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: var(--transition);
+    }
+
+    .btn-cart:hover {
+      background: var(--primary-hover);
+    }
+
+    /* Responsive Design */
+    @media (max-width: 768px) {
+      .product-container {
+        grid-template-columns: 1fr;
+        padding: 20px;
+        gap: 25px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <main class="product-container">
+    <!-- Left: Interactive Gallery -->
+    <section class="gallery">
+      <div class="main-image-wrapper">
+        <img id="mainImage" src="https://unsplash.com" alt="Apex Pro Wireless Headphones">
+      </div>
+      <div class="thumbnails">
+        <div class="thumb active" onclick="changeImage(this, 'https://unsplash.com')">
+          <img src="https://unsplash.com" alt="Thumbnail 1">
+        </div>
+        <div class="thumb" onclick="changeImage(this, 'https://unsplash.com')">
+          <img src="https://unsplash.com" alt="Thumbnail 2">
+        </div>
+        <div class="thumb" onclick="changeImage(this, 'https://unsplash.com')">
+          <img src="https://unsplash.com" alt="Thumbnail 3">
+        </div>
+        <div class="thumb" onclick="changeImage(this, 'https://unsplash.com')">
+          <img src="https://unsplash.com" alt="Thumbnail 4">
+        </div>
+      </div>
+    </section>
+
+    <!-- Right: Product Information & Controls -->
+    <section class="product-info">
+      <div>
+        <span class="badge">In Stock</span>
+        <h1 class="product-title">Apex Pro Wireless Headphones</h1>
+        
+        <div class="rating">
+          ★★★★★ <span>(4.9 / 128 Reviews)</span>
+        </div>
+
+        <div class="price-box">
+          <span class="current-price">$249.99</span>
+          <span class="original-price">$299.99</span>
+        </div>
+
+        <p class="description">
+          Experience studio-grade active noise cancellation, 40-hour battery life, and crystal-clear acoustic fidelity. Engineered with memory foam ear cushions for all-day comfort.
+        </p>
+
+        <!-- Color Swatch Selection -->
+        <div class="option-group">
+          <span class="option-label">Color: <strong id="selectedColorName">Indigo Blue</strong></span>
+          <div class="color-swatches">
+            <div class="swatch swatch-indigo selected" onclick="selectColor(this, 'Indigo Blue')"></div>
+            <div class="swatch swatch-obsidian" onclick="selectColor(this, 'Obsidian Black')"></div>
+            <div class="swatch swatch-silver" onclick="selectColor(this, 'Metallic Silver')"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quantity and Add to Cart -->
+      <div class="actions">
+        <div class="qty-selector">
+          <button class="qty-btn" onclick="updateQty(-1)">-</button>
+          <input type="text" class="qty-input" id="qtyInput" value="1" readonly>
+          <button class="qty-btn" onclick="updateQty(1)">+</button>
+        </div>
+        <button class="btn-cart" onclick="addToCart()">
+          <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+          Add to Cart
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    function changeImage(element, src) {
+      document.getElementById('mainImage').src = src;
+      document.querySelectorAll('.thumb').forEach(el => el.classList.remove('active'));
+      element.classList.add('active');
+    }
+
+    function selectColor(element, colorName) {
+      document.querySelectorAll('.swatch').forEach(el => el.classList.remove('selected'));
+      element.classList.add('selected');
+      document.getElementById('selectedColorName').innerText = colorName;
+    }
+
+    function updateQty(change) {
+      const input = document.getElementById('qtyInput');
+      let val = parseInt(input.value) + change;
+      if (val < 1) val = 1;
+      input.value = val;
+    }
+
