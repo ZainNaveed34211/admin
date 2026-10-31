@@ -222,8 +222,7 @@ async function handleCompanies(env, url) {
   return { page, pageSize, total: totalRow ? totalRow.c : 0, companies: rows.results || [] }
 }
 
-async function handleAuditLog(env, url) {
-  const { page, pageSize, offset } = parsePagination(url)
+function auditLogFilters(url) {
   const admin = (url.searchParams.get('admin') || '').trim()
   const action = (url.searchParams.get('action') || '').trim()
   const resource = (url.searchParams.get('resource') || '').trim()
@@ -252,6 +251,12 @@ async function handleAuditLog(env, url) {
     params.push(range.from, range.to)
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+  return { whereSql, params }
+}
+
+async function handleAuditLog(env, url) {
+  const { page, pageSize, offset } = parsePagination(url)
+  const { whereSql, params } = auditLogFilters(url)
   const rows = await env.DB.prepare(
     `SELECT id, admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at FROM admin_audit_log ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
   ).bind(...params, pageSize, offset).all()
@@ -259,6 +264,60 @@ async function handleAuditLog(env, url) {
     `SELECT COUNT(*) AS c FROM admin_audit_log ${whereSql}`,
   ).bind(...params).first()
   return { page, pageSize, total: totalRow ? totalRow.c : 0, entries: rows.results || [] }
+}
+
+const EXPORT_MAX_ROWS = 10000
+
+function csvCell(value) {
+  if (value === null || value === undefined) return ''
+  const text = String(value)
+  if (text.includes(',') || text.includes('"') || text.includes('\n') || text.includes('\r')) return `"${text.replaceAll('"', '""')}"`
+  return text
+}
+
+async function handleAuditExportRequest(request, env, origin) {
+  const ip = request.headers.get('CF-Connecting-IP') || ''
+  const ipHash = await sha256Hex(ip)
+  try {
+    const allowed = await checkReadRate(env.DB, 'audit-export', ipHash, Date.now())
+    if (!allowed) return errorResponse(origin, 429, 'Too many attempts. Please try again later.', 'RATE_LIMITED')
+  } catch {
+    return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
+  }
+  const { auth, error } = await authenticate(request, env, origin)
+  if (error) {
+    try {
+      await audit(env.DB, '', 'admin_access_denied', 'api', 'audit-export', '', false)
+    } catch {
+    }
+    return error
+  }
+  try {
+    const url = new URL(request.url)
+    const { whereSql, params } = auditLogFilters(url)
+    const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM admin_audit_log ${whereSql}`).bind(...params).first()
+    const total = totalRow ? totalRow.c : 0
+    const rows = await env.DB.prepare(`SELECT id, admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at FROM admin_audit_log ${whereSql} ORDER BY created_at DESC LIMIT ?`).bind(...params, EXPORT_MAX_ROWS).all()
+    const entries = rows.results || []
+    const header = 'id,admin_user_id,action,resource_type,resource_id,reason,success,correlation_id,created_at'
+    const lines = entries.map((e) => [e.id, e.admin_user_id, e.action, e.resource_type, e.resource_id, e.reason, e.success, e.correlation_id, e.created_at].map(csvCell).join(','))
+    const csv = `${header}\n${lines.join('\n')}\n`
+    const filterSummary = [url.searchParams.get('admin'), url.searchParams.get('action'), url.searchParams.get('resource'), url.searchParams.get('outcome')].filter(Boolean).join(',')
+    await audit(env.DB, auth.userId, 'audit_exported', 'audit_log', '', `Exported ${entries.length} rows${filterSummary ? ` (filters: ${filterSummary})` : ''}`, true)
+    return new Response(csv, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="kluzar-admin-audit-log.csv"',
+        'X-Total-Count': String(total),
+        'X-Export-Truncated': total > entries.length ? 'true' : 'false',
+        ...securityHeaders(),
+        ...corsHeaders(origin),
+      },
+    })
+  } catch {
+    return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
+  }
 }
 
 async function handleVerify(request, env, origin) {
@@ -550,6 +609,9 @@ export default {
     if (method === 'GET' && path === '/api/services') {
       return handleRead(request, env, origin, 'services', async () => handleServices())
     }
+    if (method === 'GET' && path === '/api/audit-log/export') {
+      return handleAuditExportRequest(request, env, origin)
+    }
     if (method === 'GET' && path.startsWith('/api/companies/')) {
       const companyId = decodeURIComponent(path.slice('/api/companies/'.length))
       if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
@@ -576,7 +638,7 @@ export default {
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'entitlement-update', async (dbEnv, auth, body) => handleEntitlementUpdate(dbEnv, auth, userId, body))
     }
-    if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path.startsWith('/api/companies/') || path === '/api/payments' || path === '/api/services' || path === '/api/audit-log') {
+    if (path === '/api/health' || path === '/api/auth/verify' || path === '/api/overview' || path === '/api/users' || path.startsWith('/api/users/') || path === '/api/companies' || path.startsWith('/api/companies/') || path === '/api/payments' || path === '/api/services' || path === '/api/audit-log' || path === '/api/audit-log/export') {
       return errorResponse(origin, 405, 'Method not allowed.', 'METHOD_NOT_ALLOWED')
     }
     return errorResponse(origin, 404, 'Not found.', 'NOT_FOUND')
