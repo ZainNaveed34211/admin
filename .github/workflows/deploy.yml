@@ -1,0 +1,41 @@
+name: Deploy Admin API
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - 'wrangler.toml'
+      - 'migrations/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run tests first (deploy only if all pass)
+        run: node --test tests/*.test.js
+      - name: Inject the real D1 ID from the GitHub variable (runner only, never committed)
+        run: |
+          sed -i "s/REPLACE_WITH_REAL_D1_DATABASE_ID/${{ vars.KLUZAR_ACCOUNTS_D1_ID }}/" wrangler.toml
+          if grep -q "REPLACE_WITH_REAL_D1_DATABASE_ID" wrangler.toml; then
+            echo "D1 ID was not replaced" >&2
+            exit 1
+          fi
+      - name: Apply D1 migrations (idempotent)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm install -g wrangler
+          wrangler d1 migrations apply kluzar-accounts --remote
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler deploy
