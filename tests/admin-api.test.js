@@ -92,7 +92,7 @@ function call(env, path, { method = 'GET', origin = ADMIN_ORIGIN, token = null }
 }
 
 test('health allows the admin origin and rejects others', async () => {
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: '{}' }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: '{}', IP_HASH_SECRET: 'test-ip-hash-secret' }
   const ok = await call(env, '/api/health')
   assert.equal(ok.status, 200)
   assert.equal((await ok.json()).ok, true)
@@ -103,7 +103,7 @@ test('health allows the admin origin and rejects others', async () => {
 test('verify accepts a valid admin assertion and audits the login', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb({ session: sessionRow() })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const token = await assertion(priv)
   const res = await call(env, '/api/auth/verify', { method: 'POST', token })
   assert.equal(res.status, 200)
@@ -111,13 +111,13 @@ test('verify accepts a valid admin assertion and audits the login', async () => 
   assert.equal(body.admin, true)
   assert.equal(body.userId, 'user-1')
   assert.equal(db.auditRows.length, 1)
-  assert.equal(db.auditRows[0].action, 'admin_login')
+  assert.equal(db.auditRows[0].action, 'admin_session_verified')
 })
 
 test('verify rejects wrong kid, wrong audience, expiry, and tampering', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb({ session: sessionRow() })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const cases = [
     await assertion(priv, { kid: 'other-v1' }),
     await assertion(priv, { aud: 'kluzar-manage-api' }),
@@ -137,25 +137,25 @@ test('verify rejects wrong kid, wrong audience, expiry, and tampering', async ()
 test('verify rejects non-allowlisted users, missing MFA, dead sessions, inactive accounts', async () => {
   const { pub, priv } = await keypair()
   const token = await assertion(priv)
-  const envNoAllow = { DB: makeDb({ session: sessionRow(), allowlisted: false }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envNoAllow = { DB: makeDb({ session: sessionRow(), allowlisted: false }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   assert.equal((await call(envNoAllow, '/api/auth/verify', { method: 'POST', token })).status, 403)
   const noMfa = await assertion(priv, { mfa: false })
-  const envOk = { DB: makeDb({ session: sessionRow() }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envOk = { DB: makeDb({ session: sessionRow() }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   assert.equal((await call(envOk, '/api/auth/verify', { method: 'POST', token: noMfa })).status, 403)
-  const envDead = { DB: makeDb({ session: sessionRow({ expires_at: new Date(NOW - 1000).toISOString() }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envDead = { DB: makeDb({ session: sessionRow({ expires_at: new Date(NOW - 1000).toISOString() }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   assert.equal((await call(envDead, '/api/auth/verify', { method: 'POST', token })).status, 401)
-  const envInactive = { DB: makeDb({ session: sessionRow({ user_status: 'suspended' }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envInactive = { DB: makeDb({ session: sessionRow({ user_status: 'suspended' }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   assert.equal((await call(envInactive, '/api/auth/verify', { method: 'POST', token })).status, 401)
-  const envNoSession = { DB: makeDb({ session: null }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envNoSession = { DB: makeDb({ session: null }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   assert.equal((await call(envNoSession, '/api/auth/verify', { method: 'POST', token })).status, 401)
-  const envFullScope = { DB: makeDb({ session: sessionRow({ scope: 'full' }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
-  assert.equal((await call(envFullScope, '/api/auth/verify', { method: 'POST', token })).status, 403)
+  const envFullScope = { DB: makeDb({ session: sessionRow({ scope: 'full' }) }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
+  assert.equal((await call(envFullScope, '/api/auth/verify', { method: 'POST', token })).status, 401)
 })
 
 test('verify rejects wrong origin, missing bearer, and unknown paths', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb({ session: sessionRow() })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const token = await assertion(priv)
   assert.equal((await call(env, '/api/auth/verify', { method: 'POST', token, origin: 'https://evil.test' })).status, 403)
   assert.equal((await call(env, '/api/auth/verify', { method: 'POST' })).status, 401)

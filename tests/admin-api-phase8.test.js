@@ -109,7 +109,7 @@ async function keypair() {
 
 async function token(priv, claims = {}) {
   const nowSec = Math.floor(NOW / 1000)
-  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, ...claims }, claims.kid || 'admin-assertion-v1')
+  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, step_up: true, ...claims }, claims.kid || 'admin-assertion-v1')
 }
 
 function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'GET', body = null } = {}) {
@@ -138,51 +138,52 @@ test('auth matrix: every protected endpoint rejects no-token, wrong-origin, non-
   const { pub, priv } = await keypair()
   const good = await token(priv)
   for (const ep of ENDPOINTS) {
-    const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+    const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
     const noAuth = await call(env, ep.path, { method: ep.method, body: ep.body || null })
     assert.equal(noAuth.status, 401, `${ep.method} ${ep.path} without token`)
     const wrongOrigin = await call(env, ep.path, { tok: good, origin: 'https://evil.test', method: ep.method, body: ep.body || null })
     assert.equal(wrongOrigin.status, 403, `${ep.method} ${ep.path} wrong origin`)
-    const envNoAllow = { DB: makeDb({ allowlisted: false }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+    const envNoAllow = { DB: makeDb({ allowlisted: false }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
     const noAllow = await call(envNoAllow, ep.path, { tok: good, method: ep.method, body: ep.body || null })
     assert.equal(noAllow.status, 403, `${ep.method} ${ep.path} non-allowlisted`)
-    const envFull = { DB: makeDb({ scope: 'full' }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+    const envFull = { DB: makeDb({ scope: 'full' }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
     const fullScope = await call(envFull, ep.path, { tok: good, method: ep.method, body: ep.body || null })
-    assert.equal(fullScope.status, 403, `${ep.method} ${ep.path} full-scope session`)
+    assert.equal(fullScope.status, 401, `${ep.method} ${ep.path} full-scope session`)
   }
 })
 
 test('assertion variants: expired, tampered, wrong audience, dead session, inactive account all rejected', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const expired = await call(env, '/api/overview', { tok: await token(priv, { iat: Math.floor(NOW / 1000) - 900, exp: Math.floor(NOW / 1000) - 600 }) })
   assert.equal(expired.status, 401)
   const good = await token(priv)
-  const tampered = good.slice(0, -1) + (good.slice(-1) === 'A' ? 'B' : 'A')
+  const tparts = good.split('.')
+  const tampered = `${tparts[0]}.${tparts[1]}.${'A'.repeat(tparts[2].length)}`
   const tamperedRes = await call(env, '/api/overview', { tok: tampered })
   assert.equal(tamperedRes.status, 401)
   const wrongAud = await call(env, '/api/overview', { tok: await token(priv, { aud: 'kluzar-manage-api' }) })
   assert.equal(wrongAud.status, 401)
   const noMfa = await call(env, '/api/overview', { tok: await token(priv, { mfa: false }) })
   assert.equal(noMfa.status, 403)
-  const envDead = { DB: makeDb({ sessionExists: false }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envDead = { DB: makeDb({ sessionExists: false }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const dead = await call(envDead, '/api/overview', { tok: good })
   assert.equal(dead.status, 401)
-  const envInactive = { DB: makeDb({ userStatus: 'suspended' }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envInactive = { DB: makeDb({ userStatus: 'suspended' }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const inactive = await call(envInactive, '/api/overview', { tok: good })
   assert.equal(inactive.status, 401)
 })
 
 test('rate limits: verify endpoint and read endpoints trip after their budgets', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   let last = null
   for (let i = 0; i < 21; i++) {
     last = await call(env, '/api/auth/verify', { tok, method: 'POST' })
   }
   assert.equal(last.status, 429)
-  const envReads = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envReads = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   for (let i = 0; i < 61; i++) {
     last = await call(envReads, '/api/overview', { tok })
   }
@@ -198,7 +199,7 @@ test('no secret columns are selected or returned anywhere', async () => {
     assert.ok(!/(password_hash|token_hash|csrf_token|ip_hash)/.test(stmt), `a SELECT names a secret column: ${stmt.slice(0, 80)}`)
   }
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const res = await call(env, '/api/users/user-1', { tok: await token(priv) })
   assert.equal(res.status, 200)
   const body = await res.text()
@@ -209,7 +210,7 @@ test('no secret columns are selected or returned anywhere', async () => {
 
 test('injection attempts fail safely and method guards hold', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const injected = await call(env, "/api/users?q=' OR '1'='1", { tok })
   assert.equal(injected.status, 200)

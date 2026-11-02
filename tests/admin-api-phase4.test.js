@@ -73,7 +73,7 @@ async function keypair() {
 
 async function token(priv) {
   const nowSec = Math.floor(NOW / 1000)
-  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true }, 'admin-assertion-v1')
+  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, step_up: true }, 'admin-assertion-v1')
 }
 
 function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'POST', body = null } = {}) {
@@ -87,7 +87,7 @@ function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'POST', b
 test('entitlement correction updates plan and audits it, payment fields untouched', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb()
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const res = await call(env, '/api/users/user-9/entitlement', { tok: await token(priv), body: { plan: 'growth', status: 'active', reason: 'Customer paid via manual invoice, grant Growth' } })
   assert.equal(res.status, 200)
   const data = await res.json()
@@ -105,7 +105,7 @@ test('entitlement correction updates plan and audits it, payment fields untouche
 test('correction rejects short reason, invalid plan, and no-change', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb()
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const short = await call(env, '/api/users/user-9/entitlement', { tok, body: { plan: 'growth', reason: 'too short' } })
   assert.equal(short.status, 400)
@@ -121,20 +121,20 @@ test('correction rejects short reason, invalid plan, and no-change', async () =>
 
 test('correction rejects unauthenticated, wrong origin, and missing entitlement', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const noAuth = await call(env, '/api/users/user-9/entitlement', { body: { plan: 'growth', reason: 'A long enough reason here' } })
   assert.equal(noAuth.status, 401)
   const wrongOrigin = await call(env, '/api/users/user-9/entitlement', { tok, origin: 'https://evil.test', body: { plan: 'growth', reason: 'A long enough reason here' } })
   assert.equal(wrongOrigin.status, 403)
-  const envNoEnt = { DB: makeDb({ entitlement: null }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envNoEnt = { DB: makeDb({ entitlement: null }), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const missing = await call(envNoEnt, '/api/users/user-9/entitlement', { tok, body: { plan: 'growth', reason: 'A long enough reason here' } })
   assert.equal(missing.status, 404)
 })
 
 test('correction rate limit trips after 20 attempts', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   let last = null
   for (let i = 0; i < 21; i++) {

@@ -130,7 +130,7 @@ async function keypair() {
 
 async function token(priv, claims = {}) {
   const nowSec = Math.floor(NOW / 1000)
-  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, ...claims }, claims.kid || 'admin-assertion-v1')
+  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, step_up: true, ...claims }, claims.kid || 'admin-assertion-v1')
 }
 
 function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'GET', body = null } = {}) {
@@ -153,7 +153,7 @@ const CO1 = { id: 'co-1', owner_user_id: 'user-1', name: 'Co' }
 test('create user: success stores pending_mfa user, entitlement, audit, and a strong one-time password', async () => {
   const { pub, tok } = await setup()
   const db = makeDb()
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const res = await call(env, '/api/users', { method: 'POST', tok, body: { email: 'New@Example.test', firstName: 'New', plan: 'growth', reason: REASON } })
   assert.equal(res.status, 200)
   const data = await res.json()
@@ -176,7 +176,7 @@ test('create user: success stores pending_mfa user, entitlement, audit, and a st
 test('create user: duplicate email, invalid email, invalid plan, and short reason are rejected', async () => {
   const { pub, tok } = await setup()
   const db = makeDb({ users: [USER2] })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const dup = await call(env, '/api/users', { method: 'POST', tok, body: { email: 'two@example.test', reason: REASON } })
   assert.equal(dup.status, 409)
   const badEmail = await call(env, '/api/users', { method: 'POST', tok, body: { email: 'not-an-email', reason: REASON } })
@@ -190,7 +190,7 @@ test('create user: duplicate email, invalid email, invalid plan, and short reaso
 
 test('create user: no token is 401 and wrong origin is 403', async () => {
   const { pub, tok } = await setup()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const noTok = await call(env, '/api/users', { method: 'POST', body: { email: 'a@example.test', reason: REASON } })
   assert.equal(noTok.status, 401)
   const wrongOrigin = await call(env, '/api/users', { method: 'POST', tok, origin: 'https://evil.example.test', body: { email: 'a@example.test', reason: REASON } })
@@ -200,7 +200,7 @@ test('create user: no token is 401 and wrong origin is 403', async () => {
 test('deactivate: success suspends, deletes sessions, and audits; self, repeat, and missing are rejected', async () => {
   const { pub, tok } = await setup()
   const db = makeDb({ users: [USER2], sessions: [{ user_id: 'user-2' }, { user_id: 'user-2' }, { user_id: 'user-1' }] })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const res = await call(env, '/api/users/user-2/deactivate', { method: 'POST', tok, body: { reason: REASON } })
   assert.equal(res.status, 200)
   const data = await res.json()
@@ -223,7 +223,7 @@ test('reactivate: suspended with MFA returns active, suspended without MFA retur
   const suspendedMfa = { ...USER2, status: 'suspended', mfa_enabled: 1 }
   const suspendedNoMfa = { id: 'user-3', email: 'three@example.test', email_normalized: 'three@example.test', password_hash: 'x', status: 'suspended', email_verified: 0, mfa_enabled: 0, first_name: '', last_name: '', phone: '', created_at: '2026-10-03T00:00:00.000Z', updated_at: '2026-10-03T00:00:00.000Z' }
   const db = makeDb({ users: [suspendedMfa, suspendedNoMfa] })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const resMfa = await call(env, '/api/users/user-2/reactivate', { method: 'POST', tok, body: { reason: REASON } })
   assert.equal(resMfa.status, 200)
   assert.equal((await resMfa.json()).status, 'active')
@@ -239,7 +239,7 @@ test('add member: insert, re-add of removed member, and all guards', async () =>
   const removed = { company_id: 'co-1', user_id: 'user-2', role: 'employee', department_id: null, status: 'removed', invited_by: 'owner-1', joined_at: '2026-10-02T00:00:00.000Z' }
   const suspendedUser = { id: 'user-4', email: 'four@example.test', email_normalized: 'four@example.test', password_hash: 'x', status: 'suspended', email_verified: 1, mfa_enabled: 1, first_name: '', last_name: '', phone: '', created_at: '2026-10-04T00:00:00.000Z', updated_at: '2026-10-04T00:00:00.000Z' }
   const db = makeDb({ users: [USER2, suspendedUser], companies: [CO1], members: [removed] })
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const reAdd = await call(env, '/api/companies/co-1/members', { method: 'POST', tok, body: { email: 'two@example.test', role: 'manager', reason: REASON } })
   assert.equal(reAdd.status, 200)
   assert.equal((await reAdd.json()).role, 'manager')
@@ -263,7 +263,7 @@ test('add member: insert, re-add of removed member, and all guards', async () =>
 
 test('method guards: PUT on the new user routes is 405', async () => {
   const { pub, tok } = await setup()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const res = await call(env, '/api/users', { method: 'PUT', tok, body: {} })
   assert.equal(res.status, 405)
   const res2 = await call(env, '/api/users/user-2/deactivate', { method: 'PUT', tok, body: {} })

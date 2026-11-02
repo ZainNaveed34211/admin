@@ -75,7 +75,7 @@ async function keypair() {
 
 async function token(priv) {
   const nowSec = Math.floor(NOW / 1000)
-  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true }, 'admin-assertion-v1')
+  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, step_up: true }, 'admin-assertion-v1')
 }
 
 function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'GET' } = {}) {
@@ -88,7 +88,7 @@ function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'GET' } =
 test('audit export returns escaped CSV, applies filters, and audits itself', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb()
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const res = await call(env, '/api/audit-log/export', { tok })
   assert.equal(res.status, 200)
@@ -109,7 +109,7 @@ test('audit export returns escaped CSV, applies filters, and audits itself', asy
 
 test('audit export rejects unauthenticated, wrong origin, and wrong method', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const noAuth = await call(env, '/api/audit-log/export')
   assert.equal(noAuth.status, 401)

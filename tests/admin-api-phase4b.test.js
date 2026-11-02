@@ -86,7 +86,7 @@ async function keypair() {
 
 async function token(priv) {
   const nowSec = Math.floor(NOW / 1000)
-  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true }, 'admin-assertion-v1')
+  return signAssertionForTest(priv, { sub: 'user-1', sid: 'sess-1', aud: 'kluzar-admin-api', iat: nowSec, exp: nowSec + 300, jti: 'jti-1', mfa: true, step_up: true }, 'admin-assertion-v1')
 }
 
 function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'GET', body = null } = {}) {
@@ -99,7 +99,7 @@ function call(env, path, { origin = ADMIN_ORIGIN, tok = null, method = 'GET', bo
 
 test('company detail returns company and members', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const res = await call(env, '/api/companies/co-1', { tok: await token(priv) })
   assert.equal(res.status, 200)
   const data = await res.json()
@@ -110,7 +110,7 @@ test('company detail returns company and members', async () => {
 test('role change and removal update members and audit', async () => {
   const { pub, priv } = await keypair()
   const db = makeDb()
-  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: db, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const changed = await call(env, '/api/companies/co-1/members/user-2/role', { tok, method: 'POST', body: { role: 'admin', reason: 'Promoted to admin for team lead duties' } })
   assert.equal(changed.status, 200)
@@ -129,7 +129,7 @@ test('role change and removal update members and audit', async () => {
 
 test('owner is protected and last owner-role member cannot be removed', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const ownerRole = await call(env, '/api/companies/co-1/members/owner-1/role', { tok, method: 'POST', body: { role: 'admin', reason: 'Trying to change the owner role here' } })
   assert.equal(ownerRole.status, 400)
@@ -137,7 +137,7 @@ test('owner is protected and last owner-role member cannot be removed', async ()
   const ownerRemove = await call(env, '/api/companies/co-1/members/owner-1/remove', { tok, method: 'POST', body: { reason: 'Trying to remove the owner here ok' } })
   assert.equal(ownerRemove.status, 400)
   const soloDb = makeDb({ company: { id: 'co-2', owner_user_id: 'owner-9' }, members: [{ company_id: 'co-2', user_id: 'user-3', role: 'owner', status: 'active', email: 'three@example.test' }] })
-  const envSolo = { DB: soloDb, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const envSolo = { DB: soloDb, ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const lastOwner = await call(envSolo, '/api/companies/co-2/members/user-3/remove', { tok, method: 'POST', body: { reason: 'Trying to remove the last owner ok' } })
   assert.equal(lastOwner.status, 400)
   assert.equal((await lastOwner.json()).code, 'LAST_OWNER')
@@ -145,7 +145,7 @@ test('owner is protected and last owner-role member cannot be removed', async ()
 
 test('member changes reject bad input, missing company or member, and unauthenticated calls', async () => {
   const { pub, priv } = await keypair()
-  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub) }
+  const env = { DB: makeDb(), ADMIN_ASSERTION_PUBLIC_KEY: JSON.stringify(pub), IP_HASH_SECRET: 'test-ip-hash-secret' }
   const tok = await token(priv)
   const badRole = await call(env, '/api/companies/co-1/members/user-2/role', { tok, method: 'POST', body: { role: 'super', reason: 'A long enough reason here' } })
   assert.equal(badRole.status, 400)

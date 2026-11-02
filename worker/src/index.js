@@ -51,10 +51,19 @@ function publicKeysByKid(env) {
   return map
 }
 
-async function sha256Hex(text) {
-  const bytes = new TextEncoder().encode(text)
-  const digest = await crypto.subtle.digest('SHA-256', bytes)
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+async function ipHash(env, ip) {
+  if (!env.IP_HASH_SECRET) throw new Error('IP_HASH_SECRET is not configured')
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.IP_HASH_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(ip))
+  return [...new Uint8Array(signature)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32)
+}
+
+async function maybeCleanupRateLimits(db, nowMs) {
+  if (Math.random() >= 0.02) return
+  const cutoff = new Date(nowMs - 2 * 60 * 60 * 1000).toISOString()
+  try {
+    await db.prepare('DELETE FROM rate_limits WHERE updated_at < ?').bind(cutoff).run()
+  } catch {}
 }
 
 async function checkRateD1(db, ipHash, nowMs) {
@@ -67,42 +76,139 @@ async function checkRateD1(db, ipHash, nowMs) {
     .prepare('SELECT count FROM rate_limits WHERE key = ? AND window_start = ?')
     .bind(`admin-verify:ip:${ipHash}`, windowStart)
     .first()
+  await maybeCleanupRateLimits(db, nowMs)
   return !!row && row.count <= VERIFY_LIMIT
 }
 
-async function audit(db, adminUserId, action, resourceType, resourceId, reason, success) {
+async function allowDenialAudit(db, ipHash, action, nowMs) {
+  const windowStart = Math.floor(nowMs / 60000)
+  await db
+    .prepare('INSERT INTO rate_limits (key, window_start, count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(key, window_start) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at')
+    .bind(`admin-denial:${action}:ip:${ipHash}`, windowStart, new Date(nowMs).toISOString())
+    .run()
+  const row = await db
+    .prepare('SELECT count FROM rate_limits WHERE key = ? AND window_start = ?')
+    .bind(`admin-denial:${action}:ip:${ipHash}`, windowStart)
+    .first()
+  return !!row && row.count <= 10
+}
+
+function authLog(reason) {
+  try {
+    console.log(JSON.stringify({ event: 'admin_auth_denied', reason }))
+  } catch {}
+}
+
+async function audit(db, adminUserId, action, resourceType, resourceId, reason, success, ipHash = '') {
   const nowIso = new Date().toISOString()
   const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await db
-    .prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(adminUserId, action, resourceType, resourceId, reason, success ? 1 : 0, correlationId, nowIso)
+    .prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(adminUserId, action, resourceType, resourceId, reason, success ? 1 : 0, correlationId, nowIso, ipHash)
     .run()
   return correlationId
 }
 
-async function authenticate(request, env, origin) {
+const STEP_UP_ENDPOINTS = new Set(['user-create', 'entitlement-update', 'member-role', 'member-remove', 'member-add', 'user-deactivate', 'user-reactivate', 'audit-export'])
+
+async function authenticate(request, env, origin, options = {}) {
   if (origin !== ADMIN_ORIGIN) return { auth: null, error: errorResponse(origin, 403, 'Request not allowed.', 'FORBIDDEN') }
   const header = request.headers.get('Authorization') || ''
   const match = header.match(/^Bearer\s+(.+)$/)
-  if (!match) return { auth: null, error: errorResponse(origin, 401, 'Missing or invalid authorization.', 'UNAUTHORIZED') }
+  if (!match) return { auth: null, error: errorResponse(origin, 401, 'Unauthorized', 'UNAUTHORIZED') }
   const verified = await verifyAssertion(match[1], publicKeysByKid(env))
-  if (!verified.ok) return { auth: null, error: errorResponse(origin, 401, verified.error, 'UNAUTHORIZED') }
+  if (!verified.ok) {
+    authLog(verified.error)
+    return { auth: null, error: errorResponse(origin, 401, 'Unauthorized', 'UNAUTHORIZED') }
+  }
   const { sub, sid } = verified.payload
   const session = await env.DB.prepare(
     'SELECT s.*, u.status AS user_status, u.email AS user_email FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.user_id = ?',
   ).bind(sid, sub).first()
-  if (!session) return { auth: null, error: errorResponse(origin, 401, 'Session no longer exists.', 'UNAUTHORIZED') }
-  if (new Date(session.expires_at).getTime() <= Date.now()) {
-    return { auth: null, error: errorResponse(origin, 401, 'Session expired.', 'UNAUTHORIZED') }
+  if (!session) {
+    authLog('no_session')
+    return { auth: null, error: errorResponse(origin, 401, 'Unauthorized', 'UNAUTHORIZED') }
   }
-  if (session.scope !== 'admin') return { auth: null, error: errorResponse(origin, 403, 'Admin session required.', 'FORBIDDEN') }
-  if (session.user_status !== 'active') return { auth: null, error: errorResponse(origin, 401, 'Account is not active.', 'UNAUTHORIZED') }
+  if (new Date(session.expires_at).getTime() <= Date.now()) {
+    authLog('session_expired')
+    return { auth: null, error: errorResponse(origin, 401, 'Unauthorized', 'UNAUTHORIZED') }
+  }
+  if (session.scope !== 'admin') {
+    authLog('wrong_scope')
+    return { auth: null, error: errorResponse(origin, 401, 'Unauthorized', 'UNAUTHORIZED') }
+  }
+  if (session.user_status !== 'active') {
+    authLog('inactive')
+    return { auth: null, error: errorResponse(origin, 401, 'Unauthorized', 'UNAUTHORIZED') }
+  }
   if (verified.payload.mfa !== true) return { auth: null, error: errorResponse(origin, 403, 'MFA is required for admin access.', 'MFA_REQUIRED') }
   const allowRow = await env.DB.prepare(
     'SELECT user_id FROM admin_allowlist WHERE user_id = ? AND role = ?',
   ).bind(sub, 'super_admin').first()
   if (!allowRow) return { auth: null, error: errorResponse(origin, 403, 'Admin access is not granted for this account.', 'FORBIDDEN') }
-  return { auth: { userId: sub, email: session.user_email || '' }, error: null }
+  if (options.requireStepUp) {
+    const ageSec = Math.floor(Date.now() / 1000) - verified.payload.iat
+    if (verified.payload.step_up !== true || ageSec > 90) {
+      return { auth: null, error: errorResponse(origin, 403, 'A fresh step-up code is required for this action.', 'STEP_UP_REQUIRED') }
+    }
+  }
+  const ip = request.headers.get('CF-Connecting-IP') || ''
+  const ipH = await ipHash(env, ip)
+  return { auth: { userId: sub, email: session.user_email || '', ipHash: ipH }, error: null }
+}
+
+async function readJsonBody(request, maxBytes = 16384) {
+  const declared = request.headers.get('Content-Length')
+  if (declared !== null && declared !== '') {
+    const n = parseInt(declared, 10)
+    if (Number.isFinite(n) && n > maxBytes) throw new Error('BODY_TOO_LARGE')
+    if (!Number.isFinite(n) || n < 0) throw new Error('BAD_JSON')
+  }
+  let text
+  const body = request.body
+  if (body && typeof body.getReader === 'function') {
+    const reader = body.getReader()
+    const chunks = []
+    let total = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value) continue
+        total += value.byteLength
+        if (total > maxBytes) {
+          try { await reader.cancel() } catch {}
+          throw new Error('BODY_TOO_LARGE')
+        }
+        chunks.push(value)
+      }
+    } finally {
+      try { reader.releaseLock() } catch {}
+    }
+    const merged = new Uint8Array(total)
+    let off = 0
+    for (const c of chunks) { merged.set(c, off); off += c.byteLength }
+    text = new TextDecoder().decode(merged)
+  } else {
+    text = await request.text()
+    if (new TextEncoder().encode(text).length > maxBytes) throw new Error('BODY_TOO_LARGE')
+  }
+  if (!text) return {}
+  try {
+    const parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('BAD_JSON')
+    return parsed
+  } catch {
+    throw new Error('BAD_JSON')
+  }
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return null
+  }
 }
 
 function parsePagination(url) {
@@ -270,24 +376,25 @@ const EXPORT_MAX_ROWS = 10000
 
 function csvCell(value) {
   if (value === null || value === undefined) return ''
-  const text = String(value)
+  let text = String(value)
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`
   if (text.includes(',') || text.includes('"') || text.includes('\n') || text.includes('\r')) return `"${text.replaceAll('"', '""')}"`
   return text
 }
 
 async function handleAuditExportRequest(request, env, origin) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
-  const ipHash = await sha256Hex(ip)
+  const ipH = await ipHash(env, ip)
   try {
-    const allowed = await checkReadRate(env.DB, 'audit-export', ipHash, Date.now())
+    const allowed = await checkReadRate(env.DB, 'audit-export', ipH, Date.now())
     if (!allowed) return errorResponse(origin, 429, 'Too many attempts. Please try again later.', 'RATE_LIMITED')
   } catch {
     return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
   }
-  const { auth, error } = await authenticate(request, env, origin)
+  const { auth, error } = await authenticate(request, env, origin, { requireStepUp: true })
   if (error) {
     try {
-      await audit(env.DB, '', 'admin_access_denied', 'api', 'audit-export', '', false)
+      if (await allowDenialAudit(env.DB, ipH, 'admin_access_denied', Date.now())) await audit(env.DB, '', 'admin_access_denied', 'api', 'audit-export', '', false, ipH)
     } catch {
     }
     return error
@@ -303,7 +410,7 @@ async function handleAuditExportRequest(request, env, origin) {
     const lines = entries.map((e) => [e.id, e.admin_user_id, e.action, e.resource_type, e.resource_id, e.reason, e.success, e.correlation_id, e.created_at].map(csvCell).join(','))
     const csv = `${header}\n${lines.join('\n')}\n`
     const filterSummary = [url.searchParams.get('admin'), url.searchParams.get('action'), url.searchParams.get('resource'), url.searchParams.get('outcome')].filter(Boolean).join(',')
-    await audit(env.DB, auth.userId, 'audit_exported', 'audit_log', '', `Exported ${entries.length} rows${filterSummary ? ` (filters: ${filterSummary})` : ''}`, true)
+    await audit(env.DB, auth.userId, 'audit_exported', 'audit_log', '', `Exported ${entries.length} rows${filterSummary ? ` (filters: ${filterSummary})` : ''}`, true, auth.ipHash)
     return new Response(csv, {
       status: 200,
       headers: {
@@ -322,10 +429,10 @@ async function handleAuditExportRequest(request, env, origin) {
 
 async function handleVerify(request, env, origin) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
-  const ipHash = await sha256Hex(ip)
+  const ipH = await ipHash(env, ip)
   let allowed
   try {
-    allowed = await checkRateD1(env.DB, ipHash, Date.now())
+    allowed = await checkRateD1(env.DB, ipH, Date.now())
   } catch {
     return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
   }
@@ -333,14 +440,14 @@ async function handleVerify(request, env, origin) {
   const { auth, error } = await authenticate(request, env, origin)
   if (error) {
     try {
-      await audit(env.DB, '', 'admin_verify_denied', 'auth', '', error.status === 403 ? 'forbidden' : 'unauthorized', false)
+      if (await allowDenialAudit(env.DB, ipH, 'admin_verify_denied', Date.now())) await audit(env.DB, '', 'admin_verify_denied', 'auth', '', error.status === 403 ? 'forbidden' : 'unauthorized', false, ipH)
     } catch {
       return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
     }
     return error
   }
   try {
-    await audit(env.DB, auth.userId, 'admin_login', 'auth', auth.userId, '', true)
+    await audit(env.DB, auth.userId, 'admin_session_verified', 'auth', auth.userId, '', true, auth.ipHash)
   } catch {
     return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
   }
@@ -357,6 +464,7 @@ async function checkReadRate(db, endpoint, ipHash, nowMs) {
     .prepare('SELECT count FROM rate_limits WHERE key = ? AND window_start = ?')
     .bind(`admin-read:${endpoint}:ip:${ipHash}`, windowStart)
     .first()
+  await maybeCleanupRateLimits(db, nowMs)
   return !!row && row.count <= 60
 }
 
@@ -370,31 +478,33 @@ async function checkMutationRate(db, ipHash, nowMs) {
     .prepare('SELECT count FROM rate_limits WHERE key = ? AND window_start = ?')
     .bind(`admin-mutation:ip:${ipHash}`, windowStart)
     .first()
+  await maybeCleanupRateLimits(db, nowMs)
   return !!row && row.count <= 20
 }
 
 async function handleMutation(request, env, origin, endpoint, handler) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
-  const ipHash = await sha256Hex(ip)
+  const ipH = await ipHash(env, ip)
   try {
-    const allowed = await checkMutationRate(env.DB, ipHash, Date.now())
+    const allowed = await checkMutationRate(env.DB, ipH, Date.now())
     if (!allowed) return errorResponse(origin, 429, 'Too many attempts. Please try again later.', 'RATE_LIMITED')
   } catch {
     return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
   }
-  const { auth, error } = await authenticate(request, env, origin)
+  const { auth, error } = await authenticate(request, env, origin, { requireStepUp: STEP_UP_ENDPOINTS.has(endpoint) })
   if (error) {
     try {
-      await audit(env.DB, '', 'admin_access_denied', 'api', endpoint, '', false)
+      if (await allowDenialAudit(env.DB, ipH, 'admin_access_denied', Date.now())) await audit(env.DB, '', 'admin_access_denied', 'api', endpoint, '', false, ipH)
     } catch {
     }
     return error
   }
   let body = null
   try {
-    body = await request.json()
-  } catch {
-    body = null
+    body = await readJsonBody(request)
+  } catch (err) {
+    if (err && err.message === 'BODY_TOO_LARGE') return errorResponse(origin, 413, 'Request is too large.', 'BODY_TOO_LARGE')
+    return errorResponse(origin, 400, 'Invalid request.', 'INVALID_BODY')
   }
   if (!body || typeof body !== 'object') return errorResponse(origin, 400, 'Invalid request.', 'INVALID_BODY')
   try {
@@ -428,7 +538,7 @@ async function handleEntitlementUpdate(env, auth, userId, body) {
   const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await env.DB.batch([
     env.DB.prepare('UPDATE entitlements SET plan = ?, status = ?, updated_at = ? WHERE user_id = ?').bind(nextPlan, nextStatus, nowIso, userId),
-    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'entitlement_corrected', 'entitlement', userId, reason, 1, correlationId, nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'entitlement_corrected', 'entitlement', userId, reason, 1, correlationId, nowIso, auth.ipHash),
   ])
   return { data: { userId, plan: nextPlan, status: nextStatus, previousPlan: prevPlan, previousStatus: prevStatus } }
 }
@@ -469,7 +579,7 @@ async function handleMemberRole(env, auth, companyId, userId, body) {
   const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await env.DB.batch([
     env.DB.prepare('UPDATE company_members SET role = ? WHERE company_id = ? AND user_id = ?').bind(role, companyId, userId),
-    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_role_changed', 'company_member', userId, body.reason.trim(), 1, correlationId, nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_role_changed', 'company_member', userId, body.reason.trim(), 1, correlationId, nowIso, auth.ipHash),
   ])
   return { data: { companyId, userId, role, previousRole: prevRole } }
 }
@@ -490,7 +600,7 @@ async function handleMemberRemove(env, auth, companyId, userId, body) {
   const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await env.DB.batch([
     env.DB.prepare("UPDATE company_members SET status = 'removed' WHERE company_id = ? AND user_id = ?").bind(companyId, userId),
-    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_removed', 'company_member', userId, body.reason.trim(), 1, correlationId, nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_removed', 'company_member', userId, body.reason.trim(), 1, correlationId, nowIso, auth.ipHash),
   ])
   return { data: { companyId, userId, status: 'removed', previousRole: prevRole } }
 }
@@ -560,9 +670,9 @@ async function handleUserCreate(env, auth, body) {
   const nowIso = new Date().toISOString()
   const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await env.DB.batch([
-    env.DB.prepare('INSERT INTO users (id, email, email_normalized, password_hash, status, email_verified, mfa_enabled, first_name, last_name, phone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(userId, email, email, passwordHash, 'pending_mfa', 0, 0, firstName, lastName, phone, nowIso, nowIso),
+    env.DB.prepare('INSERT INTO users (id, email, email_normalized, password_hash, status, email_verified, mfa_enabled, first_name, last_name, phone, created_at, updated_at, must_change_password, temp_password_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(userId, email, email, passwordHash, 'pending_mfa', 0, 0, firstName, lastName, phone, nowIso, nowIso, 1, new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()),
     env.DB.prepare('INSERT INTO entitlements (user_id, plan, status, updated_at) VALUES (?, ?, ?, ?)').bind(userId, plan, 'active', nowIso),
-    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_created', 'user', userId, body.reason.trim(), 1, correlationId, nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_created', 'user', userId, body.reason.trim(), 1, correlationId, nowIso, auth.ipHash),
   ])
   return { data: { userId, email, plan, tempPassword } }
 }
@@ -580,7 +690,7 @@ async function handleUserDeactivate(env, auth, userId, body) {
   await env.DB.batch([
     env.DB.prepare("UPDATE users SET status = 'suspended', updated_at = ? WHERE id = ?").bind(nowIso, userId),
     env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
-    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_deactivated', 'user', userId, body.reason.trim(), 1, correlationId, nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_deactivated', 'user', userId, body.reason.trim(), 1, correlationId, nowIso, auth.ipHash),
   ])
   return { data: { userId, status: 'suspended', previousStatus: prevStatus } }
 }
@@ -596,7 +706,7 @@ async function handleUserReactivate(env, auth, userId, body) {
   const correlationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await env.DB.batch([
     env.DB.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?').bind(nextStatus, nowIso, userId),
-    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_reactivated', 'user', userId, body.reason.trim(), 1, correlationId, nowIso),
+    env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'user_reactivated', 'user', userId, body.reason.trim(), 1, correlationId, nowIso, auth.ipHash),
   ])
   return { data: { userId, status: nextStatus, previousStatus: 'suspended' } }
 }
@@ -625,7 +735,7 @@ async function handleMemberAdd(env, auth, companyId, body) {
   } else {
     ops.push(env.DB.prepare('INSERT INTO company_members (company_id, user_id, role, department_id, status, invited_by, joined_at) VALUES (?, ?, ?, NULL, ?, ?, ?)').bind(companyId, user.id, role, 'active', auth.userId, nowIso))
   }
-  ops.push(env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_added', 'company_member', user.id, body.reason.trim(), 1, correlationId, nowIso))
+  ops.push(env.DB.prepare('INSERT INTO admin_audit_log (admin_user_id, action, resource_type, resource_id, reason, success, correlation_id, created_at, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(auth.userId, 'member_added', 'company_member', user.id, body.reason.trim(), 1, correlationId, nowIso, auth.ipHash))
   await env.DB.batch(ops)
   return { data: { companyId, userId: user.id, email, role, status: 'active' } }
 }
@@ -679,9 +789,9 @@ async function handleServices() {
 
 async function handleRead(request, env, origin, endpoint, handler) {
   const ip = request.headers.get('CF-Connecting-IP') || ''
-  const ipHash = await sha256Hex(ip)
+  const ipH = await ipHash(env, ip)
   try {
-    const allowed = await checkReadRate(env.DB, endpoint, ipHash, Date.now())
+    const allowed = await checkReadRate(env.DB, endpoint, ipH, Date.now())
     if (!allowed) return errorResponse(origin, 429, 'Too many attempts. Please try again later.', 'RATE_LIMITED')
   } catch {
     return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
@@ -689,7 +799,7 @@ async function handleRead(request, env, origin, endpoint, handler) {
   const { auth, error } = await authenticate(request, env, origin)
   if (error) {
     try {
-      await audit(env.DB, '', 'admin_access_denied', 'api', endpoint, '', false)
+      if (await allowDenialAudit(env.DB, ipH, 'admin_access_denied', Date.now())) await audit(env.DB, '', 'admin_access_denied', 'api', endpoint, '', false, ipH)
     } catch {
       // Denial audit is best-effort for reads; the denial itself stands.
     }
@@ -704,8 +814,7 @@ async function handleRead(request, env, origin, endpoint, handler) {
   }
 }
 
-export default {
-  async fetch(request, env) {
+async function handleFetch(request, env) {
     const origin = request.headers.get('Origin') || ''
     const url = new URL(request.url)
     const path = url.pathname
@@ -728,7 +837,7 @@ export default {
       return handleRead(request, env, origin, 'users', async (dbEnv) => handleUsers(dbEnv, url))
     }
     if (method === 'GET' && path.startsWith('/api/users/')) {
-      const userId = decodeURIComponent(path.slice('/api/users/'.length))
+      const userId = safeDecode(path.slice('/api/users/'.length))
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleRead(request, env, origin, 'user-detail', async (dbEnv) => handleUserDetail(dbEnv, userId))
     }
@@ -748,7 +857,7 @@ export default {
       return handleAuditExportRequest(request, env, origin)
     }
     if (method === 'GET' && path.startsWith('/api/companies/')) {
-      const companyId = decodeURIComponent(path.slice('/api/companies/'.length))
+      const companyId = safeDecode(path.slice('/api/companies/'.length))
       if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
       return handleRead(request, env, origin, 'company-detail', async (dbEnv) => handleCompanyDetail(dbEnv, companyId))
     }
@@ -756,20 +865,22 @@ export default {
       const rest = path.slice('/api/companies/'.length, -'/role'.length)
       const parts = rest.split('/')
       if (parts.length !== 3 || parts[1] !== 'members' || !parts[0] || !parts[2] || parts[0].length > 128 || parts[2].length > 128) return errorResponse(origin, 400, 'Invalid member id.', 'INVALID_ID')
-      const companyId = decodeURIComponent(parts[0])
-      const userId = decodeURIComponent(parts[2])
+      const companyId = safeDecode(parts[0])
+      const userId = safeDecode(parts[2])
+      if (!companyId || !userId) return errorResponse(origin, 400, 'Invalid member id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'member-role', async (dbEnv, auth, body) => handleMemberRole(dbEnv, auth, companyId, userId, body))
     }
     if (method === 'POST' && path.startsWith('/api/companies/') && path.endsWith('/remove')) {
       const rest = path.slice('/api/companies/'.length, -'/remove'.length)
       const parts = rest.split('/')
       if (parts.length !== 3 || parts[1] !== 'members' || !parts[0] || !parts[2] || parts[0].length > 128 || parts[2].length > 128) return errorResponse(origin, 400, 'Invalid member id.', 'INVALID_ID')
-      const companyId = decodeURIComponent(parts[0])
-      const userId = decodeURIComponent(parts[2])
+      const companyId = safeDecode(parts[0])
+      const userId = safeDecode(parts[2])
+      if (!companyId || !userId) return errorResponse(origin, 400, 'Invalid member id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'member-remove', async (dbEnv, auth, body) => handleMemberRemove(dbEnv, auth, companyId, userId, body))
     }
     if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/entitlement')) {
-      const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/entitlement'.length))
+      const userId = safeDecode(path.slice('/api/users/'.length, -'/entitlement'.length))
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'entitlement-update', async (dbEnv, auth, body) => handleEntitlementUpdate(dbEnv, auth, userId, body))
     }
@@ -777,17 +888,17 @@ export default {
       return handleMutation(request, env, origin, 'user-create', async (dbEnv, auth, body) => handleUserCreate(dbEnv, auth, body))
     }
     if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/deactivate')) {
-      const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/deactivate'.length))
+      const userId = safeDecode(path.slice('/api/users/'.length, -'/deactivate'.length))
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'user-deactivate', async (dbEnv, auth, body) => handleUserDeactivate(dbEnv, auth, userId, body))
     }
     if (method === 'POST' && path.startsWith('/api/users/') && path.endsWith('/reactivate')) {
-      const userId = decodeURIComponent(path.slice('/api/users/'.length, -'/reactivate'.length))
+      const userId = safeDecode(path.slice('/api/users/'.length, -'/reactivate'.length))
       if (!userId || userId.length > 128 || userId.includes('/')) return errorResponse(origin, 400, 'Invalid user id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'user-reactivate', async (dbEnv, auth, body) => handleUserReactivate(dbEnv, auth, userId, body))
     }
     if (method === 'POST' && path.startsWith('/api/companies/') && path.endsWith('/members')) {
-      const companyId = decodeURIComponent(path.slice('/api/companies/'.length, -'/members'.length))
+      const companyId = safeDecode(path.slice('/api/companies/'.length, -'/members'.length))
       if (!companyId || companyId.length > 128 || companyId.includes('/')) return errorResponse(origin, 400, 'Invalid company id.', 'INVALID_ID')
       return handleMutation(request, env, origin, 'member-add', async (dbEnv, auth, body) => handleMemberAdd(dbEnv, auth, companyId, body))
     }
@@ -795,5 +906,15 @@ export default {
       return errorResponse(origin, 405, 'Method not allowed.', 'METHOD_NOT_ALLOWED')
     }
     return errorResponse(origin, 404, 'Not found.', 'NOT_FOUND')
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      return await handleFetch(request, env)
+    } catch {
+      const origin = request.headers.get('Origin') || ''
+      return errorResponse(origin, 500, 'Service is not available right now.', 'UNAVAILABLE')
+    }
   },
 }
